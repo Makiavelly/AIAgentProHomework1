@@ -59,7 +59,7 @@ class GeneratedQuestion(BaseModel):
     success     : bool = Field(description="was it possible to form a question")
 
 @dataclass
-class LogStrongModelDomain:
+class LogModelDomain:
     model           : str
     question        : str
     answer          : str
@@ -223,12 +223,13 @@ def updateOutFile(row:str, filename: str = DATASET_FILE_NAME):
 
 
 @updateOutFile('sonnet_answer')
-def highModelSolution(
+def modelSolution(
     question    : str, 
     answer      : str, 
-    logList     : List[LogStrongModelDomain] | None = None,
+    model       : str,
+    logList     : List[LogModelDomain] | None = None,
 ) -> str:
-    outModel, cost = findingAnswer(question, STRONG_MODEL)
+    outModel, cost = findingAnswer(question, model)
 
     try:
         outModelObj = AnswerToQuestion.model_validate(
@@ -243,8 +244,8 @@ def highModelSolution(
             else:
                 right = False
 
-            rec = LogStrongModelDomain(
-                STRONG_MODEL,
+            rec = LogModelDomain(
+                model,
                 question,
                 ans,
                 cost,
@@ -326,8 +327,8 @@ def generationQuestion(
 
 @writeOutFile(LOG_FILE)
 def calcStat(
-    logList: List[LogStrongModelDomain]
-) -> Generator[LogStrongModelDomain, None, Tuple[int, float]]:
+    logList: List[LogModelDomain]
+) -> Generator[LogModelDomain, None, Tuple[int, float]]:
     right_count = 0
     total_cost = 0
     
@@ -341,18 +342,24 @@ def calcStat(
 
     return right_count, total_cost
 
-def pipeline() -> None:
-    print(f"Началась генерация вопросов. Результаты в {DATASET_FILE_NAME}")
-    generationQuestion(limit = 40)
+def pipeline(
+    f_gen_q : bool = True,
+    f_gen_a : bool = True,
+    model   : str  = STRONG_MODEL,
+) -> None:
+    if f_gen_q:
+        print(f"Началась генерация вопросов. Результаты в {DATASET_FILE_NAME}")
+        generationQuestion(limit = 40)
 
-    print(f"Началась генерация ответов сильной моделью. Логи в {LOG_FILE}")
-    logList: List[LogStrongModelDomain] = list()
-    highModelSolution(logList)
+    if f_gen_a:
+        print(f"Началась генерация ответов моделью {model}. Логи в {LOG_FILE}")
+        logList: List[LogModelDomain] = list()
+        modelSolution(model, logList)
 
-    print(f"Начался подсчет правильных ответов")
-    right_count, total_cost = calcStat(logList)
-    print(f"right_count = {right_count}, total_cost = {total_cost}")
+        print(f"Начался подсчет правильных ответов")
+        right_count, total_cost = calcStat(logList)
+        print(f"right_count = {right_count}, total_cost = {total_cost}")
 
 
 if __name__ == "__main__":
-    pipeline()
+    pipeline(False, True, WEAK_MODEL)
