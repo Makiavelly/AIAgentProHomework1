@@ -1,4 +1,4 @@
-import requests, json, os, time, tempfile, re
+import requests, json, os, time, tempfile, re, argparse
 from datetime import date
 from typing import Any, Callable, Tuple, List
 from dataclasses import dataclass, asdict, is_dataclass
@@ -603,4 +603,16 @@ def pipeline(
 
 
 if __name__ == "__main__":
-    pipeline(False, False, False, True, WEAK_MODEL)
+    parser = argparse.ArgumentParser(description="Генерация вопросов и ответов")
+    parser.add_argument("--generate", action="store_true", help="сгенерировать вопросы")
+    parser.add_argument("--answer", action="store_true", help="ответить без tools")
+    parser.add_argument("--answer-intro", action="store_true", help="ответить с webSearchIntro")
+    parser.add_argument("--answer-tools", action="store_true", help="ответить с двумя Wikipedia tools")
+    parser.add_argument("--model", default=WEAK_MODEL, help="ID модели")
+    args = parser.parse_args()
+
+    modes = (args.generate, args.answer, args.answer_intro, args.answer_tools)
+    if not any(modes):
+        parser.print_help()
+    else:
+        pipeline(*modes, model=args.model)
