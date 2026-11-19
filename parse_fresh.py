@@ -36,7 +36,7 @@ SOURCE                 = "fresh"
 DATASET_FILE_NAME      = 'my_fresh_data.jsonl'
 LOG_FILE               = 'log.jsonl'
 
-
+#взаимодействие с опенаи моделями через провайдера
 CLIENT_OPENAI = OpenAI(
     api_key            = os.getenv('API_TOOKEN_CLUB'),
     base_url           = "https://tooken.club/v1",
@@ -49,6 +49,10 @@ class AnswerToQuestion(BaseModel):
 SCHEMA_PROMPT       = f"""
 Answer strictly with one JSON object matching this schema, no text 
 around, no LaTeX:\n{json.dumps(AnswerToQuestion.model_json_schema())}
+"""
+AGENT_PROMPT_INTRO  = """
+You answer questions about events of 2026. Never answer from memory: 
+use web_search to find the right article. Do not repeat the same call.
 """
 
 
@@ -66,6 +70,7 @@ class LogModelDomain:
     cost            : float
     right           : bool
     reasoning       : str 
+    step            : int = 0
 
 @dataclass
 class QuestionDomain:
@@ -79,7 +84,8 @@ class QuestionDomain:
     sonnet_answer   : str = ""
     agent_ok        : str = ""
 
-
+#отправляет запрос через провайдера к гпт модели 
+# (мне такой способ формирвания запроса показался более экономным и быстрым)
 def questionFromLLM(
         text:       str, 
         instruct:   str | None = INSTRUCT_GENERATE_QUERY
@@ -96,11 +102,13 @@ def questionFromLLM(
     return response.output_parsed
 
 
+#заполнение параметров и обращение к апи ручке для получения инфы со страниц
 def wiki(
     key_phrase  : str          = SEARCH_ACTUAL_ARTICLES, 
     title       : str | None   = None,
     exintro     : int | None   = None,
     gsroffset   : int          = 0,
+    gsrlimit    : int          = 1,
 ) -> Any:
     params = {
         "action"        : "query",
@@ -115,11 +123,11 @@ def wiki(
         raise ValueError("Укажите только один параметр: key_phrase или title")
 
     if title: #если ищем статьи по заголовку для проверки моделей на датасете
-        params["title"] = title
-    else:     #при создании вопросов
+        params["titles"] = title
+    else:     #при создании вопросов или поиске статей по фразе
         params.update({
             "generator"     : "search",
-            "gsrlimit"      : 1,
+            "gsrlimit"      : gsrlimit,
             "gsrsearch"     : key_phrase,
             "gsroffset"     : gsroffset,
         })
@@ -136,48 +144,135 @@ def wiki(
 
     raise RuntimeError("Википедия недоступна")
 
-def jsonFrom(text):
+#определение, есть ли json схема в овтете агента
+def jsonFrom(text: str) -> Any:
     m = re.search(r"\[.*\]|\{.*\}", text or "", re.S)
     if not m:
         raise ValueError("нет JSON")
     cleaned = re.sub(r'(\\["\\/bfnrtu])|\\', lambda e: e.group(1) or "\\\\", m.group(0))
     return json.loads(cleaned, strict=False)
 
+TOOLS = {
+    "webSearchIntro" : (
+        lambda a: wiki(key_phrase=a['query'], exintro=1, gsrlimit=3),
+        {
+            "type": "function",
+            "function": {
+                "name": "webSearchIntro",
+                "description": "Searches English Wikipedia and returns the intro of the three best articles"
+            },
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "short query: a name, a title, a term and etc",
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            }
 
+        }
+    )
+}
+
+#составление пост запроса к модели через опенроутер для ответа на вопрос датасета 
 def findingAnswer(
-    question    :str,
-    model       :str = STRONG_MODEL, 
-    temperature :int = 0
+    question    : str,
+    model       : str                         = STRONG_MODEL, 
+    temperature : int                         = 0,
+    sys_prompt  : str                         = "",
+    tools       : str                  | None = None,
+    logList     : List[LogModelDomain] | None = None
 ) -> Tuple[str, float]:
-    body = {
-        "model":model,
-        "messages": [
-            {"role": "system", "content": SCHEMA_PROMPT},
-            {"role": "user", "content": question}
-        ],
-        "temperature": temperature, 
-        "usage": {"include": True},
-        "max_completion_tokens": 3000,
-    }
+    messages = [
+        {"role": "system", "content": sys_prompt + SCHEMA_PROMPT},
+        {"role": "user", "content": question}
+    ]
 
-    problem = "нет ответа"
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                OPENROUTER, 
-                json=body, 
-                headers=OPENROUTER_HEADERS,
-                timeout=120
-            )
-            if r.status_code == 200:
-                data = r.json()
-                return data['choices'][0]['message']['content'], data['usage']['cost']
-        except requests.RequestException as e:
-            problem = type(e).__name__
-        time.sleep(min(60, 3 * 2 ** attempt))
-    raise RuntimeError(problem)
+    total_cost = 0.0
+    steps = 5 if tools else 1     #максиумм 1 шаг без тулзов и 5 шагов с тулзами 
+    for step in range(steps):
+        body = {
+            "model"         : model,
+            "messages"      : messages,
+            "temperature"   : temperature, 
+            "usage"         : {"include": True},
+            "parallel_tool_calls"   : False,
+            "max_completion_tokens" : 6000,
+        }
+        if tools is not None:
+            body["tools"]       = TOOLS[tools][1]
+            body["tool_choice"] = "required" if step == 0 else "auto"
 
+        problem = "нет ответа"
+        for attempt in range(3):
+            try:
+                r = requests.post(
+                    OPENROUTER, 
+                    json=body, 
+                    headers=OPENROUTER_HEADERS,
+                    timeout=120
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    cost = data['usage']['cost']
+                    total_cost += cost
 
+                    message = data['choices'][0]['message']
+                    tool_calls = messages.get("tool_calls") or []
+
+                    if not tool_calls:
+                        return message['content'], total_cost
+
+                    messages.append(message)
+                    if logList:
+                        logElem = LogModelDomain(
+                            model=model, 
+                            question=question,
+                            answer=message['content'],
+                            cost=cost,
+                            right=False,
+                            reasoning="",
+                            step=step
+                        )
+                        logList.append(logElem)
+
+                    for tool_call in tool_calls:
+                        function = tool_call['function']
+                        tool_name = function['name']
+
+                        try:
+                            arguments = json.loads(function['arguments'] or [])
+                            func = TOOLS[tool_name][0]
+                            if func is None:
+                                raise ValueError(f"Неизвестный тул: {tool_name}")
+
+                            result = func(**arguments)
+
+                            tool_content = json.dumps(result, ensure_ascii=False) 
+                        except Exception as e:
+                            tool_content = json.dumps(
+                                {
+                                    "error": type(e).__name__,
+                                    "message": str(e)
+                                },
+                                ensure_ascii=False,
+                            )
+
+                        messages.append({
+                            "role"          : "tool",
+                            "tool_call_id"  : tool_call['id'],
+                            "name"          : tool_name,
+                            "content"       : tool_content,
+                        })
+            except requests.RequestException as e:
+                problem = type(e).__name__
+            time.sleep(min(60, 3 * 2 ** attempt))
+        raise RuntimeError(problem)
+
+#декоратор для обновления полей в файле my_fresh_data после ответов моделей на вопросы
 def updateOutFile(row:str, filename: str = DATASET_FILE_NAME):
     def decorator(func: Callable):
         @wraps(func)
@@ -222,7 +317,55 @@ def updateOutFile(row:str, filename: str = DATASET_FILE_NAME):
     return decorator
 
 
-@updateOutFile('sonnet_answer')
+#вызывает функцию запроса к моделям и упаковывает результаты
+@updateOutFile('gpt_answer_with_web_search_intro')
+def modelSolutionWithToolIntro(
+    question        : str, 
+    answer          : str, 
+    model           : str,
+    logList         : List[LogModelDomain] | None = None,
+    logListFinalAns : List[LogModelDomain] | None = None,
+) -> str:
+    outModel, cost = findingAnswer(
+        question=question, 
+        model=model,
+        sys_prompt=AGENT_PROMPT_INTRO,
+        tools="webSearchIntro",
+        logList=logList,
+    )
+
+    try:
+        outModelObj = AnswerToQuestion.model_validate(
+            jsonFrom(outModel)
+        )
+        ans = outModelObj.final
+        reasoning = outModelObj.reasoning
+
+        if logListFinalAns is not None:
+            if ans != 'unknown':
+                right = answer == ans
+            else:
+                right = False
+
+            rec = LogModelDomain(
+                model,
+                question,
+                ans,
+                cost,
+                right,
+                reasoning,
+            )
+            logListFinalAns.append(rec)
+
+        return ans
+    except (ValidationError, ValueError):
+        pass
+    
+    #наша строка (которую вряд ли напишет модель), чтоб понимать, что произошла какая-то проблема
+    return "problemXiX" 
+
+#вызывает функцию запроса к моделям и упаковывает результаты
+@updateOutFile('gpt_answer_without_tools')
 def modelSolution(
     question    : str, 
     answer      : str, 
@@ -261,7 +404,7 @@ def modelSolution(
     #наша строка (которую вряд ли напишет модель), чтоб понимать, что произошла какая-то проблема
     return "problemXiX" 
 
-
+#декоратор для записи сгенерированных вопросов в файл
 def writeOutFile(
     filename: str = DATASET_FILE_NAME
 ):
@@ -290,7 +433,8 @@ def writeOutFile(
         return wrapper
     return decorator
             
-        
+#вызывает функцию поиска инфы с википедии, 
+# вызывает функцию формирования вопроса и упаковывает результат
 @writeOutFile()
 def generationQuestion(
     limit: int = 3
@@ -298,7 +442,7 @@ def generationQuestion(
     gsroffset, count = 0, 0
 
     while count < limit:
-        article = wiki(gsroffset=gsroffset)
+        article = wiki(gsroffset=gsroffset, gsrlimit=1)
         
         gsroffset = article['continue']['gsroffset']
         print(f"gsroffset={gsroffset}")
@@ -325,6 +469,7 @@ def generationQuestion(
             print(json.dumps(page, indent=4, ensure_ascii=False))
             print(genQ)
 
+#считает количество правильных овтетов и общую стоимость
 @writeOutFile(LOG_FILE)
 def calcStat(
     logList: List[LogModelDomain]
@@ -342,9 +487,18 @@ def calcStat(
 
     return right_count, total_cost
 
+@writeOutFile('dopLogFile.jsonl')
+def write(
+    logList: List[LogModelDomain]
+) -> Generator[LogModelDomain, None, None]:
+    for elem in logList:
+        yield elem
+
+#вызывает функции генерации вопросов, ответов модели, подсчета результатов
 def pipeline(
     f_gen_q : bool = True,
     f_gen_a : bool = True,
+    f_gen_a_with_tool_intro : bool = False,
     model   : str  = STRONG_MODEL,
 ) -> None:
     if f_gen_q:
@@ -360,6 +514,19 @@ def pipeline(
         right_count, total_cost = calcStat(logList)
         print(f"right_count = {right_count}, total_cost = {total_cost}")
 
+    if f_gen_a_with_tool_intro:
+        print(f"Началась генерация ответов моделью {model} с тулзом веб поиска интро. Логи в {LOG_FILE}")
+        logList: List[LogModelDomain] = list()
+        logListFinalAns: List[LogModelDomain] = list()
+        modelSolutionWithToolIntro(model, logList, logListFinalAns)
+
+        print("Началась запись логов хода выполнения")
+        write(logList)
+
+        print(f"Начался подсчет правильных ответов")
+        right_count, total_cost = calcStat(logListFinalAns)
+        print(f"right_count = {right_count}, total_cost = {total_cost}")
+
 
 if __name__ == "__main__":
-    pipeline(False, True, WEAK_MODEL)
+    pipeline(False, False, True, WEAK_MODEL)
