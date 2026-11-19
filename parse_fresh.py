@@ -56,6 +56,12 @@ Use webSearchIntro while it is available. When it is no longer available,
 produce the final answer using the information already gathered.
 Do not repeat the same call.
 """
+AGENT_PROMPT_BOTH = """
+You answer questions about events of 2026.
+Use webSearchIntro to find relevant articles and page_find to search their full text.
+When tools are no longer available, produce the final answer using the information gathered.
+Do not repeat the same call.
+"""
 
 
 class GeneratedQuestion(BaseModel):
@@ -154,10 +160,18 @@ def jsonFrom(text: str) -> Any:
     cleaned = re.sub(r'(\\["\\/bfnrtu])|\\', lambda e: e.group(1) or "\\\\", m.group(0))
     return json.loads(cleaned, strict=False)
 
+def page_find(title: str, keywords: str) -> str:
+    pages = wiki(key_phrase="", title=title)["query"]["pages"]
+    text = next(iter(pages.values())).get("extract", "")
+    words = [w for w in re.findall(r"\w+", keywords.lower()) if len(w) > 2]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    hits = [line for line in lines if sum(w in line.lower() for w in words) >= max(1, (len(words) + 1) // 2)]
+    return "\n".join(hits[:6]) or "keywords not found on the page"
+
 TOOLS = {
     "webSearchIntro" : (
         lambda query: [
-            page.get("extract", "")
+            {"title": page.get("title", ""), "intro": page.get("extract", "")}
             for page in wiki(key_phrase=query, exintro=1, gsrlimit=3)
                 .get("query", {}).get("pages", {}).values()
         ],
@@ -165,7 +179,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "webSearchIntro",
-                "description": "Searches English Wikipedia and returns the intro of the three best articles",
+                "description": "Searches English Wikipedia and returns the titles and intros of the three best articles",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -179,6 +193,25 @@ TOOLS = {
                 }
             }
         }
+    ),
+    "page_find": (
+        lambda title, keywords: page_find(title, keywords),
+        {
+            "type": "function",
+            "function": {
+                "name": "page_find",
+                "description": "Looks inside the full text of a Wikipedia article and returns lines containing the keywords",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "exact article title"},
+                        "keywords": {"type": "string", "description": "two to five keywords from the question"},
+                    },
+                    "required": ["title", "keywords"],
+                    "additionalProperties": False,
+                }
+            }
+        }
     )
 }
 
@@ -188,7 +221,7 @@ def findingAnswer(
     model       : str                         = STRONG_MODEL, 
     temperature : int                         = 0,
     sys_prompt  : str                         = "",
-    tools       : str                  | None = None,
+    tools       : str | List[str]      | None = None,
     logList     : List[LogModelDomain] | None = None
 ) -> Tuple[str, float]:
     messages = [
@@ -197,7 +230,8 @@ def findingAnswer(
     ]
 
     total_cost = 0.0
-    steps = 5 if tools else 1     #максиумм 1 шаг без тулзов и 5 шагов с тулзами 
+    tool_names = [tools] if isinstance(tools, str) else tools
+    steps = 5 if tool_names else 1     #максиумм 1 шаг без тулзов и 5 шагов с тулзами
     for step in range(steps):
         body = {
             "model"         : model,
@@ -207,8 +241,8 @@ def findingAnswer(
             "parallel_tool_calls"   : False,
             "max_completion_tokens" : 6000,
         }
-        if tools is not None and step < steps - 1:
-            body["tools"]       = [TOOLS[tools][1]]
+        if tool_names is not None and step < steps - 1:
+            body["tools"]       = [TOOLS[name][1] for name in tool_names]
             body["tool_choice"] = "required" if step == 0 else "auto"
 
         problem = "нет ответа"
@@ -328,20 +362,20 @@ def updateOutFile(row:str, filename: str = DATASET_FILE_NAME):
     return decorator
 
 
-#вызывает функцию запроса к моделям и упаковывает результаты
-@updateOutFile('gpt_answer_with_web_search_intro')
-def modelSolutionWithToolIntro(
+def modelSolutionWithTools(
     question        : str, 
     answer          : str, 
     model           : str,
+    tools           : str | List[str],
+    sys_prompt      : str,
     logList         : List[LogModelDomain] | None = None,
     logListFinalAns : List[LogModelDomain] | None = None,
 ) -> str:
     outModel, cost = findingAnswer(
         question=question, 
         model=model,
-        sys_prompt=AGENT_PROMPT_INTRO,
-        tools="webSearchIntro",
+        sys_prompt=sys_prompt,
+        tools=tools,
         logList=logList,
     )
 
@@ -374,6 +408,21 @@ def modelSolutionWithToolIntro(
     
     #наша строка (которую вряд ли напишет модель), чтоб понимать, что произошла какая-то проблема
     return "problemXiX" 
+
+#вызывает функцию запроса к моделям и упаковывает результаты
+@updateOutFile('gpt_answer_with_web_search_intro')
+def modelSolutionWithToolIntro(question, answer, model, logList=None, logListFinalAns=None) -> str:
+    return modelSolutionWithTools(
+        question, answer, model, "webSearchIntro", AGENT_PROMPT_INTRO,
+        logList, logListFinalAns
+    )
+
+@updateOutFile('gpt_answer_with_both_wiki_tools')
+def modelSolutionWithBothTools(question, answer, model, logList=None, logListFinalAns=None) -> str:
+    return modelSolutionWithTools(
+        question, answer, model, ["webSearchIntro", "page_find"], AGENT_PROMPT_BOTH,
+        logList, logListFinalAns
+    )
 
 #вызывает функцию запроса к моделям и упаковывает результаты
 @updateOutFile('gpt_answer_without_tools')
@@ -510,6 +559,7 @@ def pipeline(
     f_gen_q : bool = True,
     f_gen_a : bool = True,
     f_gen_a_with_tool_intro : bool = False,
+    f_gen_a_with_both_tools : bool = False,
     model   : str  = STRONG_MODEL,
 ) -> None:
     if f_gen_q:
@@ -538,6 +588,19 @@ def pipeline(
         right_count, total_cost = calcStat(logListFinalAns)
         print(f"right_count = {right_count}, total_cost = {total_cost}")
 
+    if f_gen_a_with_both_tools:
+        print(f"Началась генерация ответов моделью {model} с двумя Wikipedia tools. Логи в {LOG_FILE}")
+        logList: List[LogModelDomain] = list()
+        logListFinalAns: List[LogModelDomain] = list()
+        modelSolutionWithBothTools(model, logList, logListFinalAns)
+
+        print("Началась запись логов хода выполнения")
+        write(logList)
+
+        print(f"Начался подсчет правильных ответов")
+        right_count, total_cost = calcStat(logListFinalAns)
+        print(f"right_count = {right_count}, total_cost = {total_cost}")
+
 
 if __name__ == "__main__":
-    pipeline(False, False, True, WEAK_MODEL)
+    pipeline(False, False, False, True, WEAK_MODEL)
