@@ -51,8 +51,10 @@ Answer strictly with one JSON object matching this schema, no text
 around, no LaTeX:\n{json.dumps(AnswerToQuestion.model_json_schema())}
 """
 AGENT_PROMPT_INTRO  = """
-You answer questions about events of 2026. Never answer from memory: 
-use web_search to find the right article. Do not repeat the same call.
+You answer questions about events of 2026.
+Use webSearchIntro while it is available. When it is no longer available,
+produce the final answer using the information already gathered.
+Do not repeat the same call.
 """
 
 
@@ -154,25 +156,28 @@ def jsonFrom(text: str) -> Any:
 
 TOOLS = {
     "webSearchIntro" : (
-        lambda a: wiki(key_phrase=a['query'], exintro=1, gsrlimit=3),
+        lambda query: [
+            page.get("extract", "")
+            for page in wiki(key_phrase=query, exintro=1, gsrlimit=3)
+                .get("query", {}).get("pages", {}).values()
+        ],
         {
             "type": "function",
             "function": {
                 "name": "webSearchIntro",
-                "description": "Searches English Wikipedia and returns the intro of the three best articles"
-            },
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "short query: a name, a title, a term and etc",
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": False,
+                "description": "Searches English Wikipedia and returns the intro of the three best articles",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "short query: a name, a title, a term and etc",
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                }
             }
-
         }
     )
 }
@@ -202,8 +207,8 @@ def findingAnswer(
             "parallel_tool_calls"   : False,
             "max_completion_tokens" : 6000,
         }
-        if tools is not None:
-            body["tools"]       = TOOLS[tools][1]
+        if tools is not None and step < steps - 1:
+            body["tools"]       = [TOOLS[tools][1]]
             body["tool_choice"] = "required" if step == 0 else "auto"
 
         problem = "нет ответа"
@@ -221,13 +226,13 @@ def findingAnswer(
                     total_cost += cost
 
                     message = data['choices'][0]['message']
-                    tool_calls = messages.get("tool_calls") or []
+                    tool_calls = message.get("tool_calls") or []
 
                     if not tool_calls:
                         return message['content'], total_cost
 
                     messages.append(message)
-                    if logList:
+                    if logList is not None:
                         logElem = LogModelDomain(
                             model=model, 
                             question=question,
@@ -267,11 +272,17 @@ def findingAnswer(
                             "name"          : tool_name,
                             "content"       : tool_content,
                         })
+                    break
+                else:
+                    problem = f"HTTP {r.status_code}: {r.text}"
             except requests.RequestException as e:
                 problem = type(e).__name__
             time.sleep(min(60, 3 * 2 ** attempt))
-        raise RuntimeError(problem)
-
+        else:
+            raise RuntimeError(
+                problem + "\n" +
+                json.dumps(messages, indent=4, ensure_ascii=False)
+            )
 #декоратор для обновления полей в файле my_fresh_data после ответов моделей на вопросы
 def updateOutFile(row:str, filename: str = DATASET_FILE_NAME):
     def decorator(func: Callable):
